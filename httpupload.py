@@ -1,64 +1,132 @@
 import socket
-import ssl
-import os
+import sys
+import string
+import argparse
+import re
 
-def create_multipart_form_data(file_path, boundary):
-    """Tạo dữ liệu multipart/form-data để upload file"""
-    file_name = os.path.basename(file_path)
+def get_args():
+    args = argparse.ArgumentParser()
+    args.add_argument("--url")
+    args.add_argument("--username")
+    args.add_argument("--password")
+    args.add_argument("--localfile")
+    return args.parse_args()
+  
+args = get_args()
 
-    with open(file_path, 'rb') as file:
-        file_data = file.read()
+def get_domain(url):
+    domain = ""
+    if url.startswith("https://"):
+        url = url[8:]
+    elif url.startswith("http://"):
+        url = url[7:]
+    domain = url.split('/')[0]
+    return domain
 
-    form_data = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'
-        f"Content-Type: image/jpeg\r\n\r\n"
-    ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
-
-    return form_data
-
-def send_post_request(host, path, file_path):
-    """Gửi request POST để upload file bằng socket"""
-    port = 443  # HTTPS
-    boundary = "----WebKitFormBoundaryX1a2b3c4d5e6f7g8h"
-
-    # Tạo nội dung request
-    form_data = create_multipart_form_data(file_path, boundary)
-    content_length = len(form_data)
-
-    request_headers = (
-        f"POST {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "User-Agent: Python-Socket-Upload\r\n"
-        "Accept: */*\r\n"
-        "Connection: close\r\n"
-        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
-        f"Content-Length: {content_length}\r\n"
-        "\r\n"
-    ).encode()
-
-    # Kết nối socket với SSL
-    s = socket.create_connection((host, port))
-    ssl_socket = ssl.create_default_context().wrap_socket(s, server_hostname=host)
-
-    # Gửi request
-    ssl_socket.sendall(request_headers + form_data)
-
-    # Nhận phản hồi từ server
-    response = b""
+def recvall(s):
+    total_data = []
     while True:
-        data = ssl_socket.recv(4096)
+        data = s.recv(4096)
         if not data:
             break
-        response += data
+        total_data.append(data.decode())
+    return ''.join(total_data)
 
-    ssl_socket.close()
-    return response.decode()
+def get_cookies(res):
+    cookies = []
+    stringSplit = res.split("\r\n")	
+    for i in stringSplit:
+        if "Set-Cookie: " in i:
+            cookies.append(i.split(";")[0].split(":")[1].strip())
+    return ";".join(cookies)
 
-if __name__ == "__main__":
-    host = "postman-echo.com"
-    path = "/post"  
-    file_path = "test.png" 
+def getWpNonce(cookies, domain, wp_path):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((domain, 80))
+    req = f"GET {wp_path}/wp-admin/media-new.php HTTP/1.1\r\nHost: {domain}\r\nCookie: {cookies}\r\n\r\n"
+    s.send(req.encode())
+    res = recvall(s)
+    s.close()
+    match = re.search('name="_wpnonce" value="([a-f0-9]+)"', res)
+    if match:
+        return match.group(1)
+    else:
+        print("Failed to find wpnonce")
+        exit(1)
 
-    response = send_post_request(host, path, file_path)
-    print(response)
+def upload_image(cookies, domain, wp_path, fileName, pathLocalFile):
+    with open(pathLocalFile, 'rb') as f:
+        data = f.read()
+    
+    wpnonce = getWpNonce(cookies, domain, wp_path)
+    content_type = fileName.split(".")[-1].lower()
+    
+    boundary = "----WebKitFormBoundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="name"\r\n\r\n'
+        f'{fileName}\r\n'
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="action"\r\n\r\n'
+        f'upload-attachment\r\n'
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="_wpnonce"\r\n\r\n'
+        f'{wpnonce}\r\n'
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="async-upload"; filename="{fileName}"\r\n'
+        f'Content-Type: image/{content_type}\r\n\r\n'
+    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    
+    headers = (
+        f"POST {wp_path}/wp-admin/async-upload.php HTTP/1.1\r\n"
+        f"Host: {domain}\r\n"
+        f"Cookie: {cookies}\r\n"
+        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    )
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((domain, 80))
+    s.send(headers.encode() + body)
+    res = recvall(s)
+    s.close()
+    
+    if "HTTP/1.1 200 OK" in res and "{\"success\":true" in res:
+        print("Upload success.")
+        match = re.search(r'"url":"([^"]+)"', res)
+        if match:
+            print(f"File upload url: {match.group(1).replace('\\', '')}")
+    else:
+        print("Upload fail.")
+        print(res)
+
+# Main execution
+url = args.url
+username = args.username
+password = args.password
+pathLocalFile = args.localfile
+domain = get_domain(url)
+wp_path = '/wordpress'  # Đường dẫn cố định đến thư mục WordPress
+fileName = pathLocalFile.split("/")[-1]
+
+# Đăng nhập
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((domain, 80))
+login_body = f"log={username}&pwd={password}&wp-submit=Log+In"
+headers = (
+    f"POST {wp_path}/wp-login.php HTTP/1.1\r\n"
+    f"Host: {domain}\r\n"
+    f"Content-Length: {len(login_body)}\r\n"
+    f"Content-Type: application/x-www-form-urlencoded\r\n"
+    f"Connection: close\r\n\r\n"
+)
+s.send(headers.encode() + login_body.encode())
+res = recvall(s)
+s.close()
+
+if "HTTP/1.1 302 Found" in res and "is incorrect" not in res:
+    cookies = get_cookies(res)
+    upload_image(cookies, domain, wp_path, fileName, pathLocalFile)
+else:
+    print("Đăng nhập thất bại")
+    exit(1)
