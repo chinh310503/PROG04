@@ -31,4 +31,9 @@ def get_title(url):
 
     s.close()
 
-get_title('http://example.com/')
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <URL>")
+        sys.exit(1)
+    url = sys.argv[1]
+    get_title(url)
